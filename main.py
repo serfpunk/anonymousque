@@ -1,874 +1,360 @@
-"""
-Мультипользовательский Telegram-бот для анонимных вопросов (aiogram 3.x).
-
-Точка входа для App Platform: main.py
-Токен задаётся строго через переменную окружения BOT_TOKEN.
-"""
-
+"""Anonymous Q&A bot: one polling process and PostgreSQL, aiogram 3."""
 import asyncio
-import html
 import logging
 import os
-import secrets
-import sqlite3
-from dataclasses import dataclass
-from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-    MessageOriginChannel,
-)
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageOriginChannel
 
-# --- Настройки (берутся из переменных окружения App Platform) ---
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DB_PATH = os.getenv("DB_PATH", "anon_qa_multi.db")
-CAPTION_LIMIT = 1024
+import db
+import admin
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s %(levelname)s %(name)s %(message)s')
+log = logging.getLogger('anonymousque')
+r = Router()
+r.message.filter(F.chat.type == 'private')
+r.callback_query.filter(F.message.chat.type == 'private')
 
-router = Router()
+class Flow(StatesGroup):
+    question = State()
+    answer = State()
+    channel = State()
 
+def buttons(*rows):
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows])
 
-# --- Модели ---
-@dataclass
-class UserProfile:
-    user_id: int
-    public_code: str
-    channel_id: int | None
-    channel_title: str | None
-    plan: str  # "free" | "pro"
-    plan_expires_at: str | None
+def home_keyboard(has_channel):
+    return buttons([('📥 Неотвеченные вопросы', 'inbox')], [('📢 Подключить канал', 'channel')],
+                   *([[('❌ Отключить канал', 'unlink')]] if has_channel else []),
+                   [('📊 Статистика', 'stats')])
 
+def question_keyboard(qid):
+    return buttons([('✍️ Ответить', f'answer:{qid}')], [('🚫 Заблокировать / разблокировать', f'ban:{qid}')])
 
-@dataclass
-class QuestionRecord:
-    id: int
-    asker_id: int
-    recipient_id: int
-    media_type: str  # "text" | "photo" | "voice"
-    file_id: str | None
-    text: str
+def answer_keyboard(qid, delivery_failed=False):
+    rows = []
+    if delivery_failed:
+        rows.append([('🔁 Повторить доставку ответа', f'deliver:{qid}')])
+    rows.append([('📢 Опубликовать вопрос и ответ', f'publish:{qid}')])
+    return buttons(*rows)
 
-
-# --- База данных (SQLite) ---
-def init_db() -> None:
-    db_dir = os.path.dirname(DB_PATH)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
-
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                public_code TEXT UNIQUE NOT NULL,
-                channel_id INTEGER,
-                channel_title TEXT,
-                plan TEXT NOT NULL DEFAULT 'free',
-                plan_expires_at TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS questions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                asker_id INTEGER NOT NULL,
-                recipient_id INTEGER NOT NULL,
-                media_type TEXT NOT NULL DEFAULT 'text',
-                file_id TEXT,
-                text TEXT NOT NULL DEFAULT '',
-                answered INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS bans (
-                recipient_id INTEGER NOT NULL,
-                banned_user_id INTEGER NOT NULL,
-                PRIMARY KEY (recipient_id, banned_user_id)
-            )
-            """
-        )
-
-
-def _row_to_user(row: tuple | None) -> UserProfile | None:
-    if not row:
-        return None
-    return UserProfile(
-        user_id=int(row[0]),
-        public_code=str(row[1]),
-        channel_id=int(row[2]) if row[2] is not None else None,
-        channel_title=str(row[3]) if row[3] is not None else None,
-        plan=str(row[4] or "free"),
-        plan_expires_at=row[5],
-    )
-
-
-def get_or_create_user(user_id: int) -> UserProfile:
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT user_id, public_code, channel_id, channel_title, plan, plan_expires_at "
-            "FROM users WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        if row:
-            return _row_to_user(row)  # type: ignore[return-value]
-
-        code = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
-        conn.execute(
-            "INSERT INTO users (user_id, public_code, created_at) VALUES (?, ?, ?)",
-            (user_id, code, datetime.now(timezone.utc).isoformat()),
-        )
-        return UserProfile(
-            user_id=user_id,
-            public_code=code,
-            channel_id=None,
-            channel_title=None,
-            plan="free",
-            plan_expires_at=None,
-        )
-
-
-def get_user_by_code(public_code: str) -> UserProfile | None:
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT user_id, public_code, channel_id, channel_title, plan, plan_expires_at "
-            "FROM users WHERE public_code = ?",
-            (public_code,),
-        ).fetchone()
-        return _row_to_user(row)
-
-
-def set_user_channel(user_id: int, channel_id: int | None, channel_title: str | None) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "UPDATE users SET channel_id = ?, channel_title = ? WHERE user_id = ?",
-            (channel_id, channel_title, user_id),
-        )
-
-
-def is_pro(user: UserProfile) -> bool:
-    """Точка расширения для монетизации (подписка Pro через Telegram Stars / ЮKassa и т.д.)."""
-    if user.plan != "pro":
-        return False
-    if not user.plan_expires_at:
-        return True
-    try:
-        return datetime.fromisoformat(user.plan_expires_at) > datetime.now(timezone.utc)
-    except ValueError:
-        return False
-
-
-def get_user_stats(user_id: int) -> tuple[int, int]:
-    with sqlite3.connect(DB_PATH) as conn:
-        total = conn.execute(
-            "SELECT COUNT(*) FROM questions WHERE recipient_id = ?", (user_id,)
-        ).fetchone()[0]
-        answered = conn.execute(
-            "SELECT COUNT(*) FROM questions WHERE recipient_id = ? AND answered = 1", (user_id,)
-        ).fetchone()[0]
-        return int(total), int(answered)
-
-
-def save_question(
-    asker_id: int,
-    recipient_id: int,
-    media_type: str,
-    text: str = "",
-    file_id: str | None = None,
-) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            "INSERT INTO questions (asker_id, recipient_id, media_type, file_id, text, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                asker_id,
-                recipient_id,
-                media_type,
-                file_id,
-                text,
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
-        return int(cur.lastrowid)
-
-
-def get_question(question_id: int) -> QuestionRecord | None:
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT id, asker_id, recipient_id, media_type, file_id, text "
-            "FROM questions WHERE id = ?",
-            (question_id,),
-        ).fetchone()
-        if not row:
-            return None
-        return QuestionRecord(
-            id=int(row[0]),
-            asker_id=int(row[1]),
-            recipient_id=int(row[2]),
-            media_type=str(row[3] or "text"),
-            file_id=row[4],
-            text=str(row[5] or ""),
-        )
-
-
-def mark_question_answered(question_id: int) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("UPDATE questions SET answered = 1 WHERE id = ?", (question_id,))
-
-
-def is_banned(recipient_id: int, asker_id: int) -> bool:
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM bans WHERE recipient_id = ? AND banned_user_id = ?",
-            (recipient_id, asker_id),
-        ).fetchone()
-        return row is not None
-
-
-def set_banned(recipient_id: int, asker_id: int, ban: bool) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        if ban:
-            conn.execute(
-                "INSERT OR IGNORE INTO bans (recipient_id, banned_user_id) VALUES (?, ?)",
-                (recipient_id, asker_id),
-            )
-        else:
-            conn.execute(
-                "DELETE FROM bans WHERE recipient_id = ? AND banned_user_id = ?",
-                (recipient_id, asker_id),
-            )
-
-
-# --- FSM-состояния ---
-class AskState(StatesGroup):
-    waiting_question = State()
-
-
-class ChannelState(StatesGroup):
-    waiting_channel = State()
-
-
-class ReplyState(StatesGroup):
-    waiting_channel_reply = State()
-    waiting_private_reply = State()
-
-
-# --- Вспомогательные функции ---
-def extract_payload(message: Message) -> tuple[str, str | None, str] | None:
-    if message.photo:
-        return ("photo", message.photo[-1].file_id, (message.caption or "").strip())
-    if message.voice:
-        return ("voice", message.voice.file_id, (message.caption or "").strip())
-    if message.text:
+def payload(message):
+    if message.text is not None:
         text = message.text.strip()
-        if text:
-            return ("text", None, text)
+        return ('text', None, text) if text and len(text) <= 3000 else None
+    text = (message.caption or '').strip()
+    if len(text) > 800:
+        return None
+    if message.photo:
+        return 'photo', message.photo[-1].file_id, text
+    if message.voice:
+        return 'voice', message.voice.file_id, text
     return None
 
+async def send_item(bot, chat_id, kind, file_id, body, heading, markup=None):
+    """Create a new message, never forward metadata identifying the sender."""
+    text = heading + ('\n\n' + body if body else '')
+    if kind == 'text':
+        return await bot.send_message(chat_id, text, reply_markup=markup)
+    if kind == 'photo':
+        return await bot.send_photo(chat_id, file_id, caption=text, reply_markup=markup)
+    if kind == 'voice':
+        return await bot.send_voice(chat_id, file_id, caption=text, reply_markup=markup)
+    raise ValueError('Unsupported message type')
 
-async def send_media_or_text(
-    bot: Bot,
-    chat_id: int | str,
-    media_type: str,
-    file_id: str | None,
-    text: str,
-    reply_markup: InlineKeyboardMarkup | None = None,
-    reply_to_message_id: int | None = None,
-) -> Message:
-    if media_type == "photo" and file_id:
-        if len(text) <= CAPTION_LIMIT:
-            return await bot.send_photo(
-                chat_id=chat_id,
-                photo=file_id,
-                caption=text or None,
-                reply_markup=reply_markup,
-                reply_to_message_id=reply_to_message_id,
-            )
-        media_msg = await bot.send_photo(
-            chat_id=chat_id, photo=file_id, reply_to_message_id=reply_to_message_id
-        )
-        return await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reply_markup,
-            reply_to_message_id=media_msg.message_id,
-        )
-
-    if media_type == "voice" and file_id:
-        if len(text) <= CAPTION_LIMIT:
-            return await bot.send_voice(
-                chat_id=chat_id,
-                voice=file_id,
-                caption=text or None,
-                reply_markup=reply_markup,
-                reply_to_message_id=reply_to_message_id,
-            )
-        media_msg = await bot.send_voice(
-            chat_id=chat_id, voice=file_id, reply_to_message_id=reply_to_message_id
-        )
-        return await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reply_markup,
-            reply_to_message_id=media_msg.message_id,
-        )
-
-    return await bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=reply_markup,
-        reply_to_message_id=reply_to_message_id,
-    )
-
-
-def format_question_block(record: QuestionRecord) -> str:
-    label_map = {
-        "text": "❓ <b>Анонимный вопрос:</b>",
-        "photo": "❓ <b>Анонимный вопрос (фото):</b>",
-        "voice": "❓ <b>Анонимный вопрос (голосовое):</b>",
-    }
-    header = label_map.get(record.media_type, "❓ <b>Анонимный вопрос:</b>")
-    if record.text:
-        return f"{header}\n<blockquote>{html.escape(record.text)}</blockquote>"
-    return header
-
-
-def cabinet_keyboard(user: UserProfile) -> InlineKeyboardMarkup:
-    channel_btn = (
-        InlineKeyboardButton(text="🔄 Сменить / отвязать канал", callback_data="menu:channel")
-        if user.channel_id
-        else InlineKeyboardButton(text="📢 Привязать канал", callback_data="menu:channel")
-    )
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [channel_btn],
-            [
-                InlineKeyboardButton(text="📊 Статистика", callback_data="menu:stats"),
-                InlineKeyboardButton(text="⭐ Тариф", callback_data="menu:plan"),
-            ],
-        ]
-    )
-
-
-def question_keyboard(
-    question_id: int, has_channel: bool, banned: bool = False
-) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    if has_channel:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="📢 Ответить и в канал", callback_data=f"reply_ch:{question_id}"
-                )
-            ]
-        )
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="💬 Ответить лично", callback_data=f"reply_pm:{question_id}"
-            )
-        ]
-    )
-    ban_btn = (
-        InlineKeyboardButton(text="✅ Разблокировать", callback_data=f"unban:{question_id}")
-        if banned
-        else InlineKeyboardButton(text="🚫 Заблокировать", callback_data=f"ban:{question_id}")
-    )
-    rows.append([ban_btn])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-async def show_cabinet(message: Message, bot: Bot) -> None:
-    if not message.from_user:
-        return
-    user = get_or_create_user(message.from_user.id)
+async def cabinet(message, bot, pool):
+    user = await db.register(pool, message.from_user.id)
     me = await bot.get_me()
-    personal_link = f"https://t.me/{me.username}?start={user.public_code}"
-    channel_status = (
-        f"<b>{html.escape(user.channel_title or str(user.channel_id))}</b>"
-        if user.channel_id
-        else "не привязан"
-    )
-    plan_label = "⭐ Pro" if is_pro(user) else "Free"
+    channel = user['channel_title'] or 'не подключён'
+    await message.answer(f'👋 Кабинет креатора\n\nВаша ссылка для вопросов:\nhttps://t.me/{me.username}?start={user["public_code"]}\n\nКанал: {channel}\n\nРазместите ссылку в канале. Ответы можно отправлять лично и при желании публиковать.\n\nБот может отправлять сервисные уведомления и рекламу. Чтобы прекратить все сообщения, остановите бота в Telegram.', reply_markup=home_keyboard(bool(user['channel_id'])))
 
-    await message.answer(
-        f"👋 <b>Ваш кабинет анонимных вопросов</b>\n\n"
-        f"🔗 <b>Ссылка для подписчиков:</b>\n<code>{personal_link}</code>\n\n"
-        f"📢 <b>Канал для публикаций:</b> {channel_status}\n"
-        f"💎 <b>Тариф:</b> {plan_label}\n\n"
-        f"Разместите ссылку в описании канала или в посте — вопросы (текст, фото, голосовые) "
-        f"будут приходить сюда.",
-        reply_markup=cabinet_keyboard(user),
-    )
-
-
-# --- Команды ---
-@router.message(Command("cancel"))
-async def cmd_cancel(message: Message, state: FSMContext) -> None:
-    if await state.get_state() is None:
-        return
+@r.message(Command('cancel'))
+async def cancel(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Действие отменено.")
+    await message.answer('Действие отменено. /start — открыть кабинет.')
 
-
-@router.message(CommandStart(deep_link=True))
-async def cmd_start_deep_link(
-    message: Message, command: CommandObject, state: FSMContext, bot: Bot
-) -> None:
-    if not message.from_user:
-        return
-
-    code = (command.args or "").strip()
-    recipient = get_user_by_code(code)
-    if not recipient:
-        await message.answer("Ссылка устарела или недействительна. Откройте /start, чтобы создать свою.")
-        return
-
-    if is_banned(recipient.user_id, message.from_user.id):
-        await message.answer("Вы не можете отправлять вопросы этому автору.")
-        return
-
-    await state.set_state(AskState.waiting_question)
-    await state.update_data(recipient_id=recipient.user_id)
-
-    target_hint = (
-        f"для канала «<b>{html.escape(recipient.channel_title)}</b>»"
-        if recipient.channel_title
-        else "автору"
-    )
-    await message.answer(
-        f"✍️ Напишите анонимный вопрос {target_hint}.\n"
-        f"Можно отправить <b>текст, фото или голосовое сообщение</b>.\n\n"
-        f"Для отмены отправьте /cancel."
-    )
-
-
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
+@r.message(CommandStart(deep_link=True))
+async def start_link(message: Message, command: CommandObject, state: FSMContext, pool):
     await state.clear()
-    await show_cabinet(message, bot)
-
-
-# --- Меню кабинета и привязка канала ---
-@router.callback_query(F.data.startswith("menu:"))
-async def handle_menu_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.from_user or not callback.message:
+    target = await db.by_code(pool, (command.args or '').strip())
+    if not target:
+        await message.answer('Ссылка недействительна. Попросите креатора прислать её снова.')
         return
-
-    user = get_or_create_user(callback.from_user.id)
-    action = (callback.data or "").split(":", 1)[1]
-
-    if action == "channel":
-        await state.set_state(ChannelState.waiting_channel)
-        kb = (
-            InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отвязать текущий канал", callback_data="ch:unlink")]
-                ]
-            )
-            if user.channel_id
-            else None
-        )
-        await callback.message.answer(
-            "📢 <b>Привязка канала:</b>\n"
-            "1. Добавьте этого бота администратором в ваш канал (право на публикацию сообщений).\n"
-            "2. Перешлите сюда любой пост из канала <b>или</b> отправьте его @username.\n\n"
-            "Для отмены отправьте /cancel.",
-            reply_markup=kb,
-        )
-        await callback.answer()
-    elif action == "stats":
-        total, answered = get_user_stats(user.user_id)
-        await callback.message.answer(
-            f"📊 <b>Ваша статистика:</b>\n"
-            f"• Получено вопросов: <b>{total}</b>\n"
-            f"• Отвечено: <b>{answered}</b>"
-        )
-        await callback.answer()
-    elif action == "plan":
-        if is_pro(user):
-            await callback.message.answer(
-                "⭐ У вас активен тариф <b>Pro</b>: публикации в канале идут без подписи бота."
-            )
-        else:
-            await callback.message.answer(
-                "💎 Текущий тариф: <b>Free</b>.\n\n"
-                "В бесплатной версии к постам в канале добавляется ссылка на бота, "
-                "а в будущей версии <b>Pro</b> можно будет убрать брендинг бота и подключать "
-                "дополнительные функции (оплата через Telegram Stars / внешнюю кассу)."
-            )
-        await callback.answer()
-
-
-@router.callback_query(F.data == "ch:unlink")
-async def handle_unlink_channel(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.from_user or not callback.message:
+    if target['user_id'] == message.from_user.id:
+        await message.answer('Это ваша собственная ссылка. /start — открыть кабинет.')
         return
+    if await db.is_banned(pool, target['user_id'], message.from_user.id):
+        await message.answer('Отправка вопросов этому креатору недоступна.')
+        return
+    await state.set_state(Flow.question)
+    await state.update_data(creator_id=target['user_id'])
+    name = target['channel_title'] or 'креатору'
+    await message.answer(f'✍️ Напишите вопрос: {name}. Можно отправить текст, фото или голосовое.\n\n'
+        'Креатор не увидит ваш профиль. Владелец сервиса и Telegram могут знать, кто отправил вопрос; '
+        'ваш Telegram ID хранится для доставки ответа. Креатор может опубликовать вопрос и ответ в канале. '
+        'Не включайте личные данные, если не хотите их раскрывать. Фото и голос также могут вас идентифицировать.\n\nБот может отправлять сервисные уведомления и рекламу. Чтобы прекратить все сообщения, остановите бота в Telegram. /cancel — отмена.')
+
+@r.message(CommandStart())
+async def start(message: Message, state: FSMContext, bot: Bot, pool):
     await state.clear()
-    set_user_channel(callback.from_user.id, None, None)
-    await callback.message.answer("✅ Канал отвязан. Вы по-прежнему можете принимать вопросы и отвечать лично.")
+    await cabinet(message, bot, pool)
+
+@r.callback_query(F.data == 'channel')
+async def channel_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    await state.set_state(Flow.channel)
+    await callback.message.answer('📢 Добавьте бота администратором канала с правом публикации. Затем перешлите пост из канала или отправьте его @username или числовой ID. Вы должны быть администратором этого канала. /cancel — отмена.')
 
+async def verify_channel(bot, channel_ref, uid):
+    chat = await bot.get_chat(channel_ref)
+    if chat.type != 'channel':
+        raise ValueError('Это не канал.')
+    user = await bot.get_chat_member(chat.id, uid)
+    if user.status not in ('administrator', 'creator'):
+        raise ValueError('Вы должны быть администратором канала.')
+    me = await bot.get_me()
+    member = await bot.get_chat_member(chat.id, me.id)
+    if member.status != 'administrator' or not getattr(member, 'can_post_messages', False):
+        raise ValueError('У бота нет права публиковать сообщения в канале.')
+    return chat
 
-@router.message(ChannelState.waiting_channel)
-async def process_channel_link(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not message.from_user:
-        return
-
-    chat_ref: int | str | None = None
+@r.message(Flow.channel)
+async def channel_set(message: Message, state: FSMContext, bot: Bot, pool):
+    ref = None
     if isinstance(message.forward_origin, MessageOriginChannel):
-        chat_ref = message.forward_origin.chat.id
+        ref = message.forward_origin.chat.id
     elif message.text:
         raw = message.text.strip()
-        if raw.startswith("@") or raw.lstrip("-").isdigit():
-            chat_ref = int(raw) if raw.lstrip("-").isdigit() else raw
-
-    if chat_ref is None:
-        await message.answer(
-            "Перешлите пост из канала или отправьте его @username / ID (или /cancel для отмены)."
-        )
+        if raw.startswith('@'):
+            ref = raw
+        elif raw.lstrip('-').isdigit():
+            ref = int(raw)
+    if ref is None:
+        await message.answer('Перешлите пост канала или отправьте @username / ID. /cancel — отмена.')
         return
-
     try:
-        chat = await bot.get_chat(chat_ref)
-        if chat.type != "channel":
-            await message.answer("Это не канал. Пожалуйста, укажите именно Telegram-канал.")
-            return
-
-        user_member = await bot.get_chat_member(chat.id, message.from_user.id)
-        if user_member.status not in ("creator", "administrator"):
-            await message.answer("Вы должны быть администратором или владельцем этого канала.")
-            return
-
-        me = await bot.get_me()
-        bot_member = await bot.get_chat_member(chat.id, me.id)
-        if bot_member.status != "administrator" or not getattr(bot_member, "can_post_messages", False):
-            await message.answer(
-                "Бот не имеет прав на публикацию в этом канале. "
-                "Добавьте бота в администраторы канала и выдайте право «Публикация сообщений»."
-            )
-            return
-    except Exception as exc:
-        logger.warning("Ошибка проверки канала: %s", exc)
-        await message.answer(
-            "Не удалось проверить канал. Убедитесь, что бот добавлен туда администратором, и попробуйте снова."
-        )
+        chat = await verify_channel(bot, ref, message.from_user.id)
+    except ValueError as e:
+        await message.answer(str(e))
         return
-
-    title = chat.title or (f"@{chat.username}" if chat.username else str(chat.id))
-    set_user_channel(message.from_user.id, chat.id, title)
+    except TelegramAPIError:
+        await message.answer('Не удалось проверить канал. Проверьте права бота и повторите.')
+        return
+    await db.register(pool, message.from_user.id)
+    await db.set_channel(pool, message.from_user.id, chat.id, chat.title or 'Канал')
     await state.clear()
-    await message.answer(
-        f"✅ Канал «<b>{html.escape(title)}</b>» привязан! "
-        f"Теперь под новыми вопросами появится кнопка публикации ответа в канал."
-    )
+    await message.answer('✅ Канал подключён. Публикация каждого ответа выполняется только по вашему выбору.')
 
+@r.callback_query(F.data == 'unlink')
+async def unlink(callback: CallbackQuery, pool):
+    await db.set_channel(pool, callback.from_user.id, None, None)
+    await callback.answer('Канал отключён')
+    await callback.message.answer('Канал отключён. Личные ответы продолжат работать.')
 
-# --- Отправка анонимного вопроса ---
-@router.message(AskState.waiting_question, F.text | F.photo | F.voice)
-async def process_user_question(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not message.from_user:
+@r.callback_query(F.data == 'inbox')
+async def inbox(callback: CallbackQuery, bot: Bot, pool):
+    rows = await pool.fetch("SELECT * FROM questions WHERE creator_id=$1 AND delivery_status='sent' AND answer_kind IS NULL AND NOT legacy_answered ORDER BY id DESC LIMIT 10", callback.from_user.id)
+    await callback.answer()
+    if not rows:
+        await callback.message.answer('Неотвеченных вопросов пока нет.')
         return
+    await callback.message.answer('Последние 10 неотвеченных вопросов:')
+    for q in rows:
+        await send_item(bot, callback.from_user.id, q['kind'], q['file_id'], q['body'], f'📩 Анонимный вопрос #{q["id"]}', question_keyboard(q['id']))
 
-    payload = extract_payload(message)
-    if not payload:
-        await message.answer("Отправьте текст, фото или голосовое сообщение (или /cancel).")
+@r.callback_query(F.data == 'stats')
+async def stats(callback: CallbackQuery, pool):
+    row = await pool.fetchrow('SELECT COUNT(*) AS total, COUNT(answered_at) AS answered FROM questions WHERE creator_id=$1 AND delivery_status=\'sent\'', callback.from_user.id)
+    await callback.answer()
+    await callback.message.answer(f'📊 Получено вопросов: {row["total"]}\nПодготовлено ответов: {row["answered"]}')
+
+@r.message(Flow.question)
+async def ask(message: Message, state: FSMContext, bot: Bot, pool, rate_limit: int):
+    data = payload(message)
+    if not data:
+        await message.answer('Отправьте текст до 3000 символов, фото или голосовое с подписью до 800 символов. /cancel — отмена.')
         return
-
-    data = await state.get_data()
-    recipient_id: int = data["recipient_id"]
+    flow = await state.get_data()
+    creator_id = flow.get('creator_id')
+    if not creator_id or not await db.creator(pool, creator_id):
+        await state.clear()
+        await message.answer('Ссылка больше недоступна.')
+        return
+    status, q = await db.save_question(pool, message.from_user.id, creator_id, *data, rate_limit)
+    if status == 'rate_limited':
+        await message.answer(f'Слишком часто. Подождите {rate_limit} секунд и попробуйте снова.')
+        return
+    if status == 'banned':
+        await state.clear()
+        await message.answer('Отправка вопросов этому креатору недоступна.')
+        return
     await state.clear()
-
-    if is_banned(recipient_id, message.from_user.id):
-        await message.answer("Вы не можете отправлять вопросы этому автору.")
-        return
-
-    recipient = get_or_create_user(recipient_id)
-    media_type, file_id, question_text = payload
-    question_id = save_question(
-        asker_id=message.from_user.id,
-        recipient_id=recipient_id,
-        media_type=media_type,
-        text=question_text,
-        file_id=file_id,
-    )
-
-    recipient_text = f"📩 <b>Новый анонимный вопрос #{question_id}</b>"
-    if question_text:
-        recipient_text += f"\n\n{html.escape(question_text)}"
-
     try:
-        await send_media_or_text(
-            bot=bot,
-            chat_id=recipient_id,
-            media_type=media_type,
-            file_id=file_id,
-            text=recipient_text,
-            reply_markup=question_keyboard(
-                question_id=question_id,
-                has_channel=recipient.channel_id is not None,
-            ),
-        )
-    except Exception:
-        await message.answer("Не удалось доставить вопрос автору (возможно, он остановил бота).")
+        await send_item(bot, creator_id, q['kind'], q['file_id'], q['body'], f'📩 Анонимный вопрос #{q["id"]}', question_keyboard(q['id']))
+    except TelegramAPIError:
+        await pool.execute("UPDATE questions SET delivery_status='failed' WHERE id=$1", q['id'])
+        await message.answer('Не удалось доставить вопрос креатору. Попробуйте позже.')
         return
+    await pool.execute("UPDATE questions SET delivery_status='sent' WHERE id=$1", q['id'])
+    await message.answer('✅ Вопрос отправлен. Если креатор ответит, бот пришлёт ответ сюда.')
 
-    await message.answer(
-        "✅ Вопрос отправлен анонимно! Чтобы создать собственную ссылку для вопросов, нажмите /start."
-    )
+async def get_callback_question(callback, pool):
+    try:
+        qid = int(callback.data.split(':', 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer('Некорректная кнопка.', show_alert=True)
+        return None
+    q = await db.question(pool, qid, callback.from_user.id)
+    if not q:
+        await callback.answer('Вопрос не найден.', show_alert=True)
+    return q
 
-
-@router.message(AskState.waiting_question)
-async def unsupported_question_type(message: Message) -> None:
-    await message.answer(
-        "Сейчас можно отправлять только текст, фото и голосовые сообщения (или /cancel)."
-    )
-
-
-# --- Кнопки под вопросом у получателя ---
-@router.callback_query(F.data.startswith(("reply_ch:", "reply_pm:", "ban:", "unban:")))
-async def handle_question_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.from_user or not callback.message:
+@r.callback_query(F.data.startswith(('answer:', 'reply_pm:', 'reply_ch:')))
+async def answer_start(callback: CallbackQuery, state: FSMContext, pool):
+    q = await get_callback_question(callback, pool)
+    if not q: return
+    if q['legacy_answered']:
+        await callback.answer('В старой версии на этот вопрос уже ответили; содержимое ответа не сохранилось.', show_alert=True)
         return
-
-    action, raw_id = (callback.data or "").split(":", 1)
-    question_id = int(raw_id)
-    record = get_question(question_id)
-
-    if not record or record.recipient_id != callback.from_user.id:
-        await callback.answer("Вопрос не найден.", show_alert=True)
+    if q['answer_kind']:
+        await callback.answer('Ответ уже подготовлен.', show_alert=True)
+        await callback.message.answer('Вы можете повторить доставку или опубликовать ответ.', reply_markup=answer_keyboard(q['id'], q['answer_delivery_status'] != 'sent'))
         return
+    await state.set_state(Flow.answer)
+    await state.update_data(question_id=q['id'])
+    await callback.answer()
+    await callback.message.answer(f'Напишите ответ на вопрос #{q["id"]}: текст, фото или голосовое. Ответ будет отправлен лично; затем можно будет опубликовать его в канале. /cancel — отмена.')
 
-    recipient = get_or_create_user(callback.from_user.id)
+@r.callback_query(F.data.startswith('ban:'))
+async def ban(callback: CallbackQuery, pool):
+    q = await get_callback_question(callback, pool)
+    if not q: return
+    is_now_banned = await db.toggle_ban(pool, callback.from_user.id, q['asker_id'])
+    await callback.answer('Отправитель заблокирован.' if is_now_banned else 'Отправитель разблокирован.', show_alert=True)
 
-    if action == "reply_ch":
-        if not recipient.channel_id:
-            await callback.answer("Сначала привяжите канал в меню /start.", show_alert=True)
-            return
-        await state.set_state(ReplyState.waiting_channel_reply)
-        await state.update_data(question_id=question_id)
-        await callback.message.answer(
-            f"✍️ Отправьте ответ на вопрос #{question_id} (текст, фото или голосовое) — "
-            "он будет опубликован в вашем канале.\nДля отмены отправьте /cancel."
-        )
-        await callback.answer()
-    elif action == "reply_pm":
-        await state.set_state(ReplyState.waiting_private_reply)
-        await state.update_data(question_id=question_id)
-        await callback.message.answer(
-            f"✍️ Отправьте личный ответ на вопрос #{question_id} (текст, фото или голосовое).\n"
-            "Для отмены отправьте /cancel."
-        )
-        await callback.answer()
-    elif action == "ban":
-        set_banned(recipient.user_id, record.asker_id, True)
-        await callback.message.edit_reply_markup(
-            reply_markup=question_keyboard(
-                question_id, has_channel=recipient.channel_id is not None, banned=True
-            )
-        )
-        await callback.answer("Отправитель заблокирован для ваших вопросов.")
-    elif action == "unban":
-        set_banned(recipient.user_id, record.asker_id, False)
-        await callback.message.edit_reply_markup(
-            reply_markup=question_keyboard(
-                question_id, has_channel=recipient.channel_id is not None, banned=False
-            )
-        )
-        await callback.answer("Отправитель разблокирован.")
+async def deliver_answer(bot, pool, qid, uid):
+    q = await db.claim_answer(pool, qid, uid)
+    if not q:
+        return 'unavailable'
+    try:
+        await send_item(bot, q['asker_id'], q['answer_kind'], q['answer_file_id'], q['answer_body'] or '', f'💬 Ответ на ваш вопрос #{qid}')
+    except TelegramAPIError:
+        await pool.execute("UPDATE questions SET answer_delivery_status='failed',answer_claimed_at=NULL WHERE id=$1 AND creator_id=$2", qid, uid)
+        return 'failed'
+    await pool.execute("UPDATE questions SET answer_delivery_status='sent',answer_claimed_at=NULL WHERE id=$1 AND creator_id=$2", qid, uid)
+    return 'sent'
 
-
-# --- Обработка ответов владельца канала ---
-@router.message(ReplyState.waiting_channel_reply, F.text | F.photo | F.voice)
-async def process_channel_reply(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not message.from_user:
+@r.message(Flow.answer)
+async def answer(message: Message, state: FSMContext, bot: Bot, pool):
+    data = payload(message)
+    if not data:
+        await message.answer('Отправьте текст до 3000 символов, фото или голосовое с подписью до 800 символов. /cancel — отмена.')
         return
-
-    payload = extract_payload(message)
-    if not payload:
-        await message.answer("Отправьте текст, фото или голосовое сообщение (или /cancel).")
-        return
-
-    reply_type, reply_file_id, reply_text = payload
-    data = await state.get_data()
-    question_id: int = data["question_id"]
-    record = get_question(question_id)
+    qid = (await state.get_data()).get('question_id')
     await state.clear()
-
-    if not record or record.recipient_id != message.from_user.id:
-        await message.answer("Не удалось найти исходный вопрос.")
+    if not qid:
+        await message.answer('Действие устарело. Нажмите «Ответить» ещё раз.')
         return
-
-    recipient = get_or_create_user(message.from_user.id)
-    if not recipient.channel_id:
-        await message.answer("Канал не привязан. Привяжите его в меню /start.")
+    q = await db.save_answer(pool, qid, message.from_user.id, *data)
+    if not q:
+        await message.answer('Вопрос не найден или ответ уже подготовлен.')
         return
+    status = await deliver_answer(bot, pool, qid, message.from_user.id)
+    result = '✅ Ответ отправлен автору вопроса.' if status == 'sent' else '⚠️ Ответ сохранён, но доставка не подтверждена. Можно повторить.'
+    await message.answer(result + '\n\nПри желании опубликуйте вопрос и ответ в подключённом канале.', reply_markup=answer_keyboard(qid, status != 'sent'))
 
-    me = await bot.get_me()
-    ask_link = f"https://t.me/{me.username}?start={recipient.public_code}"
-    footer = (
-        ""
-        if is_pro(recipient)
-        else f'\n\n<i><a href="{ask_link}">Задать анонимный вопрос</a></i>'
-    )
-    q_block = format_question_block(record)
-    answer_block = (
-        f"💬 <b>Ответ:</b>\n{html.escape(reply_text)}" if reply_text else "💬 <b>Ответ:</b>"
-    )
+@r.callback_query(F.data.startswith('deliver:'))
+async def retry_delivery(callback: CallbackQuery, bot: Bot, pool):
+    q = await get_callback_question(callback, pool)
+    if not q: return
+    await callback.answer()
+    status = await deliver_answer(bot, pool, q['id'], callback.from_user.id)
+    text = {'sent':'✅ Ответ доставлен.', 'failed':'⚠️ Не удалось доставить ответ: возможно, пользователь заблокировал бота.', 'unavailable':'Ответ уже доставлен или доставка ещё выполняется.'}[status]
+    await callback.message.answer(text, reply_markup=answer_keyboard(q['id'], status == 'failed'))
 
+@r.callback_query(F.data.startswith('publish:'))
+async def publish(callback: CallbackQuery, bot: Bot, pool):
+    q = await get_callback_question(callback, pool)
+    if not q: return
+    creator = await db.creator(pool, callback.from_user.id)
+    if not creator or not creator['channel_id']:
+        await callback.answer('Сначала подключите канал через /start.', show_alert=True)
+        return
+    if q['published_answer_message_id']:
+        await callback.answer('Этот ответ уже опубликован.', show_alert=True)
+        return
+    if q['published_channel_id'] and q['published_channel_id'] != creator['channel_id']:
+        await callback.answer('Публикация началась в другом канале. Подключите прежний канал, чтобы завершить её.', show_alert=True)
+        return
     try:
-        if record.media_type == "text" and reply_type == "text":
-            await bot.send_message(
-                chat_id=recipient.channel_id,
-                text=f"{q_block}\n\n{answer_block}{footer}",
-                disable_web_page_preview=True,
-            )
-        elif record.media_type == "text" and reply_type in ("photo", "voice"):
-            await send_media_or_text(
-                bot=bot,
-                chat_id=recipient.channel_id,
-                media_type=reply_type,
-                file_id=reply_file_id,
-                text=f"{q_block}\n\n{answer_block}{footer}",
-            )
-        elif record.media_type in ("photo", "voice") and reply_type == "text":
-            await send_media_or_text(
-                bot=bot,
-                chat_id=recipient.channel_id,
-                media_type=record.media_type,
-                file_id=record.file_id,
-                text=f"{q_block}\n\n{answer_block}{footer}",
-            )
-        else:
-            q_msg = await send_media_or_text(
-                bot=bot,
-                chat_id=recipient.channel_id,
-                media_type=record.media_type,
-                file_id=record.file_id,
-                text=q_block,
-            )
-            await send_media_or_text(
-                bot=bot,
-                chat_id=recipient.channel_id,
-                media_type=reply_type,
-                file_id=reply_file_id,
-                text=f"{answer_block}{footer}",
-                reply_to_message_id=q_msg.message_id,
-            )
-    except Exception as exc:
-        logger.exception("Ошибка публикации в канал")
-        await message.answer(
-            f"Не удалось опубликовать в канал ({html.escape(str(exc))}). "
-            "Проверьте, что бот всё ещё администратор канала."
-        )
+        await verify_channel(bot, creator['channel_id'], callback.from_user.id)
+    except (TelegramAPIError, ValueError):
+        await callback.answer('Не удалось проверить права в канале. Проверьте права бота и свои права.', show_alert=True)
         return
-
-    mark_question_answered(question_id)
-
-    asker_caption = "📩 <b>Автор ответил на твой вопрос и опубликовал его в канале!</b>"
-    if record.text:
-        asker_caption += f"\n\n<i>Твой вопрос:</i> {html.escape(record.text)}"
-    if reply_text:
-        asker_caption += f"\n<i>Ответ:</i> {html.escape(reply_text)}"
-
+    q = await db.claim_publish(pool, q['id'], callback.from_user.id)
+    if not q:
+        await callback.answer('Публикация уже завершена или выполняется.', show_alert=True)
+        return
+    await callback.answer()
+    cid, qid = creator['channel_id'], q['id']
+    if q['published_channel_id'] and q['published_channel_id'] != cid:
+        await pool.execute('UPDATE questions SET publish_claimed_at=NULL WHERE id=$1 AND creator_id=$2', qid, callback.from_user.id)
+        await callback.message.answer('Публикация началась в другом канале. Подключите прежний канал.')
+        return
     try:
-        await send_media_or_text(
-            bot=bot,
-            chat_id=record.asker_id,
-            media_type=reply_type,
-            file_id=reply_file_id,
-            text=asker_caption,
-        )
-    except Exception:
-        pass
-
-    await message.answer(f"✅ Вопрос #{question_id} и ваш ответ опубликованы в канале.")
-
-
-@router.message(ReplyState.waiting_private_reply, F.text | F.photo | F.voice)
-async def process_private_reply(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not message.from_user:
+        if not q['published_question_message_id']:
+            qm = await send_item(bot, cid, q['kind'], q['file_id'], q['body'], f'❓ Анонимный вопрос #{qid}')
+            await pool.execute('UPDATE questions SET published_channel_id=$3,published_question_message_id=$4 WHERE id=$1 AND creator_id=$2', qid, callback.from_user.id, cid, qm.message_id)
+        am = await send_item(bot, cid, q['answer_kind'], q['answer_file_id'], q['answer_body'] or '', f'💬 Ответ на вопрос #{qid}')
+        await pool.execute('UPDATE questions SET published_answer_message_id=$3,publish_claimed_at=NULL WHERE id=$1 AND creator_id=$2', qid, callback.from_user.id, am.message_id)
+    except TelegramAPIError:
+        await pool.execute('UPDATE questions SET publish_claimed_at=NULL WHERE id=$1 AND creator_id=$2', qid, callback.from_user.id)
+        await callback.message.answer('⚠️ Не удалось завершить публикацию. Проверьте права бота. Вопрос мог уже появиться в канале; повторная попытка продолжит публикацию.', reply_markup=answer_keyboard(qid))
         return
+    await callback.message.answer('✅ Вопрос и ответ опубликованы в канале.')
 
-    payload = extract_payload(message)
-    if not payload:
-        await message.answer("Отправьте текст, фото или голосовое сообщение (или /cancel).")
-        return
+@r.message()
+async def fallback(message: Message):
+    await message.answer('Откройте /start, чтобы получить ссылку креатора. Чтобы задать вопрос, перейдите по персональной ссылке креатора.')
 
-    reply_type, reply_file_id, reply_text = payload
-    data = await state.get_data()
-    question_id: int = data["question_id"]
-    record = get_question(question_id)
-    await state.clear()
-
-    if not record or record.recipient_id != message.from_user.id:
-        await message.answer("Не удалось найти исходный вопрос.")
-        return
-
-    asker_caption = "💬 <b>Личный ответ на твой анонимный вопрос:</b>"
-    if record.text:
-        asker_caption += f"\n\n<i>Твой вопрос:</i> {html.escape(record.text)}"
-    if reply_text:
-        asker_caption += f"\n<i>Ответ:</i> {html.escape(reply_text)}"
-
+async def main():
+    token = os.getenv('BOT_TOKEN', '').strip()
+    url = os.getenv('DATABASE_URL', '').strip()
+    if not token or not url:
+        raise SystemExit('BOT_TOKEN and DATABASE_URL are required')
     try:
-        await send_media_or_text(
-            bot=bot,
-            chat_id=record.asker_id,
-            media_type=reply_type,
-            file_id=reply_file_id,
-            text=asker_caption,
-        )
-        mark_question_answered(question_id)
-        await message.answer(f"✅ Личный ответ на вопрос #{question_id} отправлен автору.")
-    except Exception:
-        await message.answer("Не удалось доставить ответ (возможно, пользователь заблокировал бота).")
-
-
-@router.message(ReplyState.waiting_channel_reply)
-@router.message(ReplyState.waiting_private_reply)
-async def unsupported_reply_type(message: Message) -> None:
-    await message.answer(
-        "Поддерживаются только текст, фото и голосовые сообщения. Попробуйте снова или отправьте /cancel."
-    )
-
-
-@router.message()
-async def fallback_handler(message: Message, bot: Bot) -> None:
-    await message.answer(
-        "Чтобы открыть свой кабинет и получить ссылку для анонимных вопросов, нажмите /start.\n"
-        "Чтобы задать вопрос автору канала, перейдите по его персональной ссылке."
-    )
-
-
-async def main() -> None:
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "Не задана переменная окружения BOT_TOKEN. Добавьте её в настройках App Platform."
-        )
-
-    init_db()
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        rate = int(os.getenv('RATE_LIMIT_SECONDS', '60'))
+        if rate < 1: raise ValueError
+    except ValueError:
+        raise SystemExit('RATE_LIMIT_SECONDS must be a positive integer')
+    try:
+        raw_ids = os.getenv('ADMIN_IDS', '')
+        admin_ids = frozenset(int(x.strip()) for x in raw_ids.split(',') if x.strip())
+        if any(uid <= 0 for uid in admin_ids): raise ValueError
+    except ValueError:
+        raise SystemExit('ADMIN_IDS must contain numeric Telegram user IDs separated by commas')
+    pool = await db.create_pool(url)
+    bot = Bot(token)
     dp = Dispatcher()
-    dp.include_router(router)
-    logger.info("Мультипользовательский бот запущен...")
-    await dp.start_polling(bot)
+    dp.message.outer_middleware(admin.TrackUsers())
+    dp.callback_query.outer_middleware(admin.TrackUsers())
+    dp.include_router(admin.router)
+    dp.include_router(r)
+    broadcast_wakeup = asyncio.Event()
+    worker = asyncio.create_task(admin.broadcast_worker(bot, pool, broadcast_wakeup))
+    try:
+        # Polling and webhook cannot be active together. Do not discard pending updates.
+        await bot.delete_webhook(drop_pending_updates=False)
+        await dp.start_polling(bot, pool=pool, rate_limit=rate, admin_ids=admin_ids, broadcast_wakeup=broadcast_wakeup, handle_signals=True)
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        await bot.session.close()
+        await pool.close()
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())

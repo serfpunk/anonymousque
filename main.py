@@ -1,14 +1,16 @@
 """Anonymous Q&A bot: one polling process and PostgreSQL, aiogram 3."""
 import asyncio
+import html
 import logging
 import os
+from urllib.parse import quote
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageOriginChannel
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message, MessageOriginChannel
 
 import db
 import admin
@@ -65,6 +67,21 @@ async def send_item(bot, chat_id, kind, file_id, body, heading, markup=None):
     if kind == 'voice':
         return await bot.send_voice(chat_id, file_id, caption=text, reply_markup=markup)
     raise ValueError('Unsupported message type')
+
+def combined_post(question, answer, username, public_code):
+    """Render text-only Q&A as one post; do not truncate user content."""
+    question, answer = question or '', answer or ''
+    label = 'Задать анонимный вопрос'
+    plain = f'❓ Анонимный вопрос:\n{question}\n\n💬 Ответ:\n{answer}\n\n{label}'
+    # Telegram's entity offsets and limits are measured in UTF-16 code units.
+    if len(plain.encode('utf-16-le')) // 2 > 4096:
+        return None
+    link = f'https://t.me/{quote(username, safe="")}?start={quote(public_code, safe="")}'
+    return (
+        f'❓ <b>Анонимный вопрос:</b>\n<blockquote>{html.escape(question)}</blockquote>\n\n'
+        f'💬 <b>Ответ:</b>\n{html.escape(answer)}\n\n'
+        f'<a href="{html.escape(link, quote=True)}">{label}</a>'
+    )
 
 async def cabinet(message, bot, pool):
     user = await db.register(pool, message.from_user.id)
@@ -306,11 +323,27 @@ async def publish(callback: CallbackQuery, bot: Bot, pool):
         await callback.message.answer('Публикация началась в другом канале. Подключите прежний канал.')
         return
     try:
-        if not q['published_question_message_id']:
-            qm = await send_item(bot, cid, q['kind'], q['file_id'], q['body'], f'❓ Анонимный вопрос #{qid}')
-            await pool.execute('UPDATE questions SET published_channel_id=$3,published_question_message_id=$4 WHERE id=$1 AND creator_id=$2', qid, callback.from_user.id, cid, qm.message_id)
-        am = await send_item(bot, cid, q['answer_kind'], q['answer_file_id'], q['answer_body'] or '', f'💬 Ответ на вопрос #{qid}')
-        await pool.execute('UPDATE questions SET published_answer_message_id=$3,publish_claimed_at=NULL WHERE id=$1 AND creator_id=$2', qid, callback.from_user.id, am.message_id)
+        post = None
+        if not q['published_question_message_id'] and q['kind'] == 'text' and q['answer_kind'] == 'text':
+            me = await bot.get_me()
+            if me.username:
+                post = combined_post(q['body'], q['answer_body'], me.username, creator['public_code'])
+        if post is not None:
+            message = await bot.send_message(
+                cid, post, parse_mode='HTML',
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+            await pool.execute('''UPDATE questions SET published_channel_id=$3,
+                published_question_message_id=$4,published_answer_message_id=$4,
+                publish_claimed_at=NULL WHERE id=$1 AND creator_id=$2''',
+                qid, callback.from_user.id, cid, message.message_id)
+        else:
+            # Preserve media, long messages and publications already started by older code.
+            if not q['published_question_message_id']:
+                qm = await send_item(bot, cid, q['kind'], q['file_id'], q['body'], f'❓ Анонимный вопрос #{qid}')
+                await pool.execute('UPDATE questions SET published_channel_id=$3,published_question_message_id=$4 WHERE id=$1 AND creator_id=$2', qid, callback.from_user.id, cid, qm.message_id)
+            am = await send_item(bot, cid, q['answer_kind'], q['answer_file_id'], q['answer_body'] or '', f'💬 Ответ на вопрос #{qid}')
+            await pool.execute('UPDATE questions SET published_answer_message_id=$3,publish_claimed_at=NULL WHERE id=$1 AND creator_id=$2', qid, callback.from_user.id, am.message_id)
     except TelegramAPIError:
         await pool.execute('UPDATE questions SET publish_claimed_at=NULL WHERE id=$1 AND creator_id=$2', qid, callback.from_user.id)
         await callback.message.answer('⚠️ Не удалось завершить публикацию. Проверьте права бота. Вопрос мог уже появиться в канале; повторная попытка продолжит публикацию.', reply_markup=answer_keyboard(qid))

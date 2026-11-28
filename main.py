@@ -25,6 +25,7 @@ class Flow(StatesGroup):
     question = State()
     answer = State()
     channel = State()
+    greeting = State()
 
 def buttons(*rows):
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows])
@@ -32,10 +33,10 @@ def buttons(*rows):
 def home_keyboard(has_channel):
     return buttons([('📥 Неотвеченные вопросы', 'inbox')], [('📢 Подключить канал', 'channel')],
                    *([[('❌ Отключить канал', 'unlink')]] if has_channel else []),
-                   [('📊 Статистика', 'stats')])
+                   [('⚙️ Настройки вопросов', 'settings')], [('📊 Статистика', 'stats')], [('🆘 Поддержка', 'support')])
 
 def question_keyboard(qid):
-    return buttons([('✍️ Ответить', f'answer:{qid}')], [('🚫 Заблокировать / разблокировать', f'ban:{qid}')])
+    return buttons([('✍️ Ответить', f'answer:{qid}')], [('⏭ Пропустить', f'skip:{qid}')], [('🚫 Заблокировать / разблокировать', f'ban:{qid}')])
 
 def answer_keyboard(qid, delivery_failed=False):
     rows = []
@@ -47,26 +48,36 @@ def answer_keyboard(qid, delivery_failed=False):
 def payload(message):
     if message.text is not None:
         text = message.text.strip()
-        return ('text', None, text) if text and len(text) <= 3000 else None
+        return ('text', None, text) if text and len(text.encode('utf-16-le')) // 2 <= 3000 else None
     text = (message.caption or '').strip()
-    if len(text) > 800:
+    if len(text.encode('utf-16-le')) // 2 > 800:
         return None
+    if getattr(message, 'video', None):
+        return 'video', message.video.file_id, text
     if message.photo:
         return 'photo', message.photo[-1].file_id, text
     if message.voice:
         return 'voice', message.voice.file_id, text
     return None
 
-async def send_item(bot, chat_id, kind, file_id, body, heading, markup=None):
+async def send_item(bot, chat_id, kind, file_id, body, heading, markup=None, footer=None):
     """Create a new message, never forward metadata identifying the sender."""
-    text = heading + ('\n\n' + body if body else '')
+    text = heading + ('\n\n' + body if body else '') + ('\n\n' + footer if footer else '')
     if kind == 'text':
         return await bot.send_message(chat_id, text, reply_markup=markup)
     if kind == 'photo':
         return await bot.send_photo(chat_id, file_id, caption=text, reply_markup=markup)
     if kind == 'voice':
         return await bot.send_voice(chat_id, file_id, caption=text, reply_markup=markup)
+    if kind == 'video':
+        return await bot.send_video(chat_id, file_id, caption=text, reply_markup=markup)
     raise ValueError('Unsupported message type')
+
+def question_link(username, public_code):
+    return f'https://t.me/{quote(username, safe="")}?start={quote(public_code, safe="")}'
+
+def question_footer(username, public_code):
+    return '🔗 Задать анонимный вопрос:\n' + question_link(username, public_code)
 
 def combined_post(question, answer, username, public_code):
     """Render text-only Q&A as one post; do not truncate user content."""
@@ -76,7 +87,7 @@ def combined_post(question, answer, username, public_code):
     # Telegram's entity offsets and limits are measured in UTF-16 code units.
     if len(plain.encode('utf-16-le')) // 2 > 4096:
         return None
-    link = f'https://t.me/{quote(username, safe="")}?start={quote(public_code, safe="")}'
+    link = question_link(username, public_code)
     return (
         f'❓ <b>Анонимный вопрос:</b>\n<blockquote>{html.escape(question)}</blockquote>\n\n'
         f'💬 <b>Ответ:</b>\n{html.escape(answer)}\n\n'
@@ -104,16 +115,21 @@ async def start_link(message: Message, command: CommandObject, state: FSMContext
     if target['user_id'] == message.from_user.id:
         await message.answer('Это ваша собственная ссылка. /start — открыть кабинет.')
         return
+    if not target['accepting_questions']:
+        await message.answer('Креатор временно закрыл приём вопросов. Попробуйте позже.')
+        return
     if await db.is_banned(pool, target['user_id'], message.from_user.id):
         await message.answer('Отправка вопросов этому креатору недоступна.')
         return
     await state.set_state(Flow.question)
     await state.update_data(creator_id=target['user_id'])
     name = target['channel_title'] or 'креатору'
-    await message.answer(f'✍️ Напишите вопрос: {name}. Можно отправить текст, фото или голосовое.\n\n'
+    allowed = ', '.join(label for kind, label in (('text','текст'), ('photo','фото'), ('voice','голосовое'), ('video','видео')) if target['allow_' + kind]) or 'нет доступных форматов'
+    greeting = f'Сообщение креатора: {target["greeting"]}\n\n' if target['greeting'] else ''
+    await message.answer(f'{greeting}✍️ Напишите вопрос: {name}. Доступно: {allowed}.\n\n'
         'Креатор не увидит ваш профиль. Владелец сервиса и Telegram могут знать, кто отправил вопрос; '
         'ваш Telegram ID хранится для доставки ответа. Креатор может опубликовать вопрос и ответ в канале. '
-        'Не включайте личные данные, если не хотите их раскрывать. Фото и голос также могут вас идентифицировать.\n\nБот может отправлять сервисные уведомления и рекламу. Чтобы прекратить все сообщения, остановите бота в Telegram. /cancel — отмена.')
+        'Не включайте личные данные, если не хотите их раскрывать. Фото и голос также могут вас идентифицировать.\n\nБот может отправлять сервисные уведомления и рекламу. Чтобы прекратить все сообщения, остановите бота в Telegram. /cancel — отмена. /support — связь с поддержкой.')
 
 @r.message(CommandStart())
 async def start(message: Message, state: FSMContext, bot: Bot, pool):
@@ -172,36 +188,137 @@ async def unlink(callback: CallbackQuery, pool):
     await callback.answer('Канал отключён')
     await callback.message.answer('Канал отключён. Личные ответы продолжат работать.')
 
+def inbox_menu():
+    return buttons([('📥 Новые', 'inbox:new:0'), ('✅ Отвеченные', 'inbox:answered:0')],
+                   [('⏭ Пропущенные', 'inbox:skipped:0')])
+
 @r.callback_query(F.data == 'inbox')
-async def inbox(callback: CallbackQuery, bot: Bot, pool):
-    rows = await pool.fetch("SELECT * FROM questions WHERE creator_id=$1 AND delivery_status='sent' AND answer_kind IS NULL AND NOT legacy_answered ORDER BY id DESC LIMIT 10", callback.from_user.id)
+async def inbox(callback: CallbackQuery):
     await callback.answer()
-    if not rows:
-        await callback.message.answer('Неотвеченных вопросов пока нет.')
+    await callback.message.answer('Выберите список вопросов:', reply_markup=inbox_menu())
+
+@r.callback_query(F.data.startswith('inbox:'))
+async def inbox_page(callback: CallbackQuery, bot: Bot, pool):
+    try:
+        _, category, raw = callback.data.split(':')
+        offset = int(raw)
+        if category not in ('new','answered','skipped') or offset < 0 or offset > 1000000: raise ValueError
+    except (ValueError, AttributeError):
+        await callback.answer('Некорректная кнопка.', show_alert=True); return
+    filters = {'new': "answer_kind IS NULL AND NOT legacy_answered AND NOT skipped",
+               'answered': '(answer_kind IS NOT NULL OR legacy_answered)',
+               'skipped': 'skipped AND answer_kind IS NULL AND NOT legacy_answered'}
+    where = filters[category]
+    count = await pool.fetchval(f"SELECT COUNT(*) FROM questions WHERE creator_id=$1 AND delivery_status='sent' AND {where}", callback.from_user.id)
+    if not count:
+        await callback.answer(); await callback.message.answer('В этом списке пока нет вопросов.', reply_markup=inbox_menu()); return
+    offset = min(offset, count - 1)
+    q = await pool.fetchrow(f"SELECT * FROM questions WHERE creator_id=$1 AND delivery_status='sent' AND {where} ORDER BY id DESC LIMIT 1 OFFSET $2", callback.from_user.id, offset)
+    if not q:
+        await callback.answer('Список изменился, откройте его снова.', show_alert=True); return
+    rows = []
+    if category == 'new': rows += [[('✍️ Ответить', f'answer:{q["id"]}'), ('⏭ Пропустить', f'skip:{q["id"]}')]]
+    if category == 'skipped': rows += [[('↩️ Вернуть в новые', f'restore:{q["id"]}')]]
+    if category == 'answered' and q['answer_kind']:
+        rows += [[('📢 Опубликовать', f'publish:{q["id"]}')]]
+        if q['answer_delivery_status'] != 'sent': rows += [[('🔁 Повторить доставку', f'deliver:{q["id"]}')]]
+    nav = []
+    if offset > 0: nav.append(('⬅️ Назад', f'inbox:{category}:{offset-1}'))
+    if offset + 1 < count: nav.append(('Вперёд ➡️', f'inbox:{category}:{offset+1}'))
+    if nav: rows.append(nav)
+    rows.append([('📋 Списки', 'inbox')])
+    await callback.answer()
+    suffix = ' · старый ответ не сохранился' if q['legacy_answered'] else ''
+    heading = f'📩 Вопрос #{q["id"]} · {offset+1}/{count}{suffix}'
+    me = await bot.get_me()
+    creator = await db.creator(pool, callback.from_user.id)
+    footer = question_footer(me.username, creator['public_code']) if me.username and creator else None
+    if category == 'answered' and q['answer_kind']:
+        await send_item(bot, callback.from_user.id, q['kind'], q['file_id'], q['body'], heading, footer=footer)
+        await send_item(bot, callback.from_user.id, q['answer_kind'], q['answer_file_id'], q['answer_body'] or '', '💬 Ваш ответ', buttons(*rows))
+    else:
+        await send_item(bot, callback.from_user.id, q['kind'], q['file_id'], q['body'], heading, buttons(*rows), footer=footer)
+
+@r.callback_query(F.data.startswith(('skip:', 'restore:')))
+async def skip_question(callback: CallbackQuery, pool):
+    q = await get_callback_question(callback, pool)
+    if not q: return
+    skip = callback.data.startswith('skip:')
+    changed = await pool.fetchval("UPDATE questions SET skipped=$3 WHERE id=$1 AND creator_id=$2 AND answer_kind IS NULL AND NOT legacy_answered AND skipped<>$3 RETURNING true", q['id'], callback.from_user.id, skip)
+    await callback.answer('Сохранено' if changed else 'Вопрос уже изменился', show_alert=not bool(changed))
+    if changed: await callback.message.answer('⏭ Вопрос пропущен.' if skip else '↩️ Вопрос возвращён в новые.', reply_markup=inbox_menu())
+
+def settings_keyboard(user):
+    mark = lambda v: '✅' if v else '❌'
+    return buttons([(f'{mark(user["accepting_questions"])} Приём вопросов', 'set:accepting_questions')],
+        [(f'{mark(user["allow_text"])} Текст', 'set:allow_text'), (f'{mark(user["allow_photo"])} Фото', 'set:allow_photo')],
+        [(f'{mark(user["allow_voice"])} Голосовые', 'set:allow_voice'), (f'{mark(user["allow_video"])} Видео', 'set:allow_video')],
+        [('✏️ Приветствие', 'set:greeting')])
+
+@r.callback_query(F.data == 'settings')
+async def settings(callback: CallbackQuery, pool):
+    user = await db.register(pool, callback.from_user.id)
+    await callback.answer()
+    await callback.message.answer('⚙️ Настройки вопросов\nНажмите на пункт, чтобы изменить его. Приветствие показывается до отправки вопроса.', reply_markup=settings_keyboard(user))
+
+@r.callback_query(F.data.startswith('set:'))
+async def settings_change(callback: CallbackQuery, state: FSMContext, pool):
+    key = callback.data.split(':',1)[1]
+    if key == 'greeting':
+        await state.set_state(Flow.greeting); await callback.answer()
+        await callback.message.answer('Отправьте приветствие до 300 символов. Чтобы удалить его, отправьте /clear_greeting. /cancel — отмена.')
         return
-    await callback.message.answer('Последние 10 неотвеченных вопросов:')
-    for q in rows:
-        await send_item(bot, callback.from_user.id, q['kind'], q['file_id'], q['body'], f'📩 Анонимный вопрос #{q["id"]}', question_keyboard(q['id']))
+    if key not in ('accepting_questions','allow_text','allow_photo','allow_voice','allow_video'):
+        await callback.answer('Некорректная настройка.', show_alert=True); return
+    user = await pool.fetchrow(f'UPDATE creators SET {key}=NOT {key} WHERE user_id=$1 RETURNING *', callback.from_user.id)
+    if not user:
+        await callback.answer('Откройте /start.', show_alert=True); return
+    await callback.answer('Сохранено')
+    await callback.message.answer('⚙️ Настройки обновлены. Если выключить все форматы, вопросы отправить нельзя.', reply_markup=settings_keyboard(user))
+
+@r.message(Flow.greeting)
+async def set_greeting(message: Message, state: FSMContext, pool):
+    text = (message.text or '').strip()
+    if text == '/clear_greeting': text = ''
+    elif not text or len(text) > 300:
+        await message.answer('Нужен текст до 300 символов. Для удаления отправьте /clear_greeting.'); return
+    await pool.execute('UPDATE creators SET greeting=$2 WHERE user_id=$1', message.from_user.id, text)
+    await state.clear()
+    await message.answer('✅ Приветствие сохранено. /start — кабинет.')
 
 @r.callback_query(F.data == 'stats')
 async def stats(callback: CallbackQuery, pool):
-    row = await pool.fetchrow('SELECT COUNT(*) AS total, COUNT(answered_at) AS answered FROM questions WHERE creator_id=$1 AND delivery_status=\'sent\'', callback.from_user.id)
+    row = await pool.fetchrow("""SELECT COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE created_at >= now()-interval '7 days') AS week,
+        COUNT(*) FILTER (WHERE created_at >= now()-interval '14 days' AND created_at < now()-interval '7 days') AS previous_week,
+        COUNT(*) FILTER (WHERE answered_at >= now()-interval '7 days') AS answered_week,
+        COUNT(*) FILTER (WHERE published_at >= now()-interval '7 days') AS published_week,
+        COUNT(*) FILTER (WHERE answer_kind IS NOT NULL OR legacy_answered) AS answered,
+        COUNT(*) FILTER (WHERE answer_kind IS NULL AND NOT legacy_answered AND NOT skipped) AS new,
+        COUNT(*) FILTER (WHERE skipped AND answer_kind IS NULL AND NOT legacy_answered) AS skipped,
+        COUNT(*) FILTER (WHERE published_answer_message_id IS NOT NULL) AS published
+        FROM questions WHERE creator_id=$1 AND delivery_status='sent'""", callback.from_user.id)
     await callback.answer()
-    await callback.message.answer(f'📊 Получено вопросов: {row["total"]}\nПодготовлено ответов: {row["answered"]}')
+    await callback.message.answer(f'📊 Статистика\nПолучено всего: {row["total"]}\nЗа последние 7 дней: {row["week"]}; за предыдущие 7 дней: {row["previous_week"]}\nНовых: {row["new"]}\nОтвеченных: {row["answered"]}\nПропущенных: {row["skipped"]}\nОпубликовано ответов: {row["published"]}\nЗа последние 7 дней: ответов {row["answered_week"]}, публикаций {row["published_week"]}\n\nДаты публикаций учитываются только после этого обновления. В ответах учитываются также отметки из старой версии; их содержание могло не сохраниться.')
 
 @r.message(Flow.question)
 async def ask(message: Message, state: FSMContext, bot: Bot, pool, rate_limit: int):
     data = payload(message)
     if not data:
-        await message.answer('Отправьте текст до 3000 символов, фото или голосовое с подписью до 800 символов. /cancel — отмена.')
+        await message.answer('Отправьте текст до 3000 символов, фото, видео или голосовое с подписью до 800 символов. /cancel — отмена.')
         return
     flow = await state.get_data()
     creator_id = flow.get('creator_id')
-    if not creator_id or not await db.creator(pool, creator_id):
+    creator = await db.creator(pool, creator_id) if creator_id else None
+    if not creator:
         await state.clear()
         await message.answer('Ссылка больше недоступна.')
         return
     status, q = await db.save_question(pool, message.from_user.id, creator_id, *data, rate_limit)
+    if status == 'closed':
+        await state.clear(); await message.answer('Креатор временно закрыл приём вопросов.'); return
+    if status == 'type_disabled':
+        await message.answer('Этот формат сейчас отключён креатором. Попробуйте другой.'); return
     if status == 'rate_limited':
         await message.answer(f'Слишком часто. Подождите {rate_limit} секунд и попробуйте снова.')
         return
@@ -211,7 +328,9 @@ async def ask(message: Message, state: FSMContext, bot: Bot, pool, rate_limit: i
         return
     await state.clear()
     try:
-        await send_item(bot, creator_id, q['kind'], q['file_id'], q['body'], f'📩 Анонимный вопрос #{q["id"]}', question_keyboard(q['id']))
+        me = await bot.get_me()
+        footer = question_footer(me.username, creator['public_code']) if me.username else None
+        await send_item(bot, creator_id, q['kind'], q['file_id'], q['body'], f'📩 Анонимный вопрос #{q["id"]}', question_keyboard(q['id']), footer=footer)
     except TelegramAPIError:
         await pool.execute("UPDATE questions SET delivery_status='failed' WHERE id=$1", q['id'])
         await message.answer('Не удалось доставить вопрос креатору. Попробуйте позже.')
@@ -234,6 +353,8 @@ async def get_callback_question(callback, pool):
 async def answer_start(callback: CallbackQuery, state: FSMContext, pool):
     q = await get_callback_question(callback, pool)
     if not q: return
+    if q.get('skipped'):
+        await callback.answer('Сначала верните вопрос в новые через список пропущенных.', show_alert=True); return
     if q['legacy_answered']:
         await callback.answer('В старой версии на этот вопрос уже ответили; содержимое ответа не сохранилось.', show_alert=True)
         return
@@ -244,7 +365,7 @@ async def answer_start(callback: CallbackQuery, state: FSMContext, pool):
     await state.set_state(Flow.answer)
     await state.update_data(question_id=q['id'])
     await callback.answer()
-    await callback.message.answer(f'Напишите ответ на вопрос #{q["id"]}: текст, фото или голосовое. Ответ будет отправлен лично; затем можно будет опубликовать его в канале. /cancel — отмена.')
+    await callback.message.answer(f'Напишите ответ на вопрос #{q["id"]}: текст, фото, видео или голосовое. Ответ будет отправлен лично; затем можно будет опубликовать его в канале. /cancel — отмена.')
 
 @r.callback_query(F.data.startswith('ban:'))
 async def ban(callback: CallbackQuery, pool):
@@ -269,7 +390,7 @@ async def deliver_answer(bot, pool, qid, uid):
 async def answer(message: Message, state: FSMContext, bot: Bot, pool):
     data = payload(message)
     if not data:
-        await message.answer('Отправьте текст до 3000 символов, фото или голосовое с подписью до 800 символов. /cancel — отмена.')
+        await message.answer('Отправьте текст до 3000 символов, фото, видео или голосовое с подписью до 800 символов. /cancel — отмена.')
         return
     qid = (await state.get_data()).get('question_id')
     await state.clear()
@@ -335,15 +456,18 @@ async def publish(callback: CallbackQuery, bot: Bot, pool):
             )
             await pool.execute('''UPDATE questions SET published_channel_id=$3,
                 published_question_message_id=$4,published_answer_message_id=$4,
-                publish_claimed_at=NULL WHERE id=$1 AND creator_id=$2''',
+                published_at=now(),publish_claimed_at=NULL WHERE id=$1 AND creator_id=$2''',
                 qid, callback.from_user.id, cid, message.message_id)
         else:
             # Preserve media, long messages and publications already started by older code.
+            me = await bot.get_me()
+            link_markup = (InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='Задать анонимный вопрос', url=question_link(me.username, creator['public_code']))]]) if me.username else None)
+            footer = question_footer(me.username, creator['public_code']) if me.username else None
             if not q['published_question_message_id']:
-                qm = await send_item(bot, cid, q['kind'], q['file_id'], q['body'], f'❓ Анонимный вопрос #{qid}')
+                qm = await send_item(bot, cid, q['kind'], q['file_id'], q['body'], f'❓ Анонимный вопрос #{qid}', link_markup, footer=footer)
                 await pool.execute('UPDATE questions SET published_channel_id=$3,published_question_message_id=$4 WHERE id=$1 AND creator_id=$2', qid, callback.from_user.id, cid, qm.message_id)
-            am = await send_item(bot, cid, q['answer_kind'], q['answer_file_id'], q['answer_body'] or '', f'💬 Ответ на вопрос #{qid}')
-            await pool.execute('UPDATE questions SET published_answer_message_id=$3,publish_claimed_at=NULL WHERE id=$1 AND creator_id=$2', qid, callback.from_user.id, am.message_id)
+            am = await send_item(bot, cid, q['answer_kind'], q['answer_file_id'], q['answer_body'] or '', f'💬 Ответ на вопрос #{qid}', link_markup)
+            await pool.execute('UPDATE questions SET published_answer_message_id=$3,published_at=now(),publish_claimed_at=NULL WHERE id=$1 AND creator_id=$2', qid, callback.from_user.id, am.message_id)
     except TelegramAPIError:
         await pool.execute('UPDATE questions SET publish_claimed_at=NULL WHERE id=$1 AND creator_id=$2', qid, callback.from_user.id)
         await callback.message.answer('⚠️ Не удалось завершить публикацию. Проверьте права бота. Вопрос мог уже появиться в канале; повторная попытка продолжит публикацию.', reply_markup=answer_keyboard(qid))

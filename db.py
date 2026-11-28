@@ -41,10 +41,10 @@ CREATE TABLE IF NOT EXISTS questions (
     id BIGSERIAL PRIMARY KEY,
     asker_id BIGINT NOT NULL,
     creator_id BIGINT NOT NULL REFERENCES creators(user_id),
-    kind TEXT NOT NULL CHECK (kind IN ('text', 'photo', 'voice')),
+    kind TEXT NOT NULL CHECK (kind IN ('text', 'photo', 'voice', 'video')),
     file_id TEXT,
     body TEXT NOT NULL DEFAULT '',
-    answer_kind TEXT CHECK (answer_kind IN ('text', 'photo', 'voice')),
+    answer_kind TEXT CHECK (answer_kind IN ('text', 'photo', 'voice', 'video')),
     answer_file_id TEXT,
     answer_body TEXT,
     answered_at TIMESTAMPTZ,
@@ -58,6 +58,25 @@ CREATE TABLE IF NOT EXISTS questions (
     publish_claimed_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE creators ADD COLUMN IF NOT EXISTS accepting_questions BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE creators ADD COLUMN IF NOT EXISTS allow_text BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE creators ADD COLUMN IF NOT EXISTS allow_photo BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE creators ADD COLUMN IF NOT EXISTS allow_voice BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE creators ADD COLUMN IF NOT EXISTS allow_video BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE creators ADD COLUMN IF NOT EXISTS greeting TEXT NOT NULL DEFAULT '';
+ALTER TABLE questions ADD COLUMN IF NOT EXISTS skipped BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE questions ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ;
+DO $migration$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='questions'::regclass AND conname='questions_kind_check' AND pg_get_constraintdef(oid) LIKE '%video%') THEN
+        ALTER TABLE questions DROP CONSTRAINT IF EXISTS questions_kind_check;
+        ALTER TABLE questions ADD CONSTRAINT questions_kind_check CHECK (kind IN ('text','photo','voice','video'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='questions'::regclass AND conname='questions_answer_kind_check' AND pg_get_constraintdef(oid) LIKE '%video%') THEN
+        ALTER TABLE questions DROP CONSTRAINT IF EXISTS questions_answer_kind_check;
+        ALTER TABLE questions ADD CONSTRAINT questions_answer_kind_check CHECK (answer_kind IN ('text','photo','voice','video'));
+    END IF;
+END $migration$;
 CREATE INDEX IF NOT EXISTS questions_creator_id_idx ON questions(creator_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS bans (
     creator_id BIGINT NOT NULL REFERENCES creators(user_id),
@@ -133,6 +152,11 @@ async def toggle_ban(pool, creator_id, asker_id):
 async def save_question(pool, asker_id, creator_id, kind, file_id, body, interval):
     # Atomic database throttle across restarts; block list checked again at submission.
     async with pool.acquire() as con, con.transaction():
+        settings = await con.fetchrow('SELECT * FROM creators WHERE user_id=$1 FOR SHARE', creator_id)
+        if not settings or not settings['accepting_questions']:
+            return 'closed', None
+        if kind not in ('text','photo','voice','video') or not settings['allow_' + kind]:
+            return 'type_disabled', None
         if await con.fetchval('SELECT EXISTS(SELECT 1 FROM bans WHERE creator_id=$1 AND asker_id=$2)', creator_id, asker_id):
             return 'banned', None
         allowed = await con.fetchval('''INSERT INTO rate_limits(creator_id,asker_id,last_sent_at) VALUES($1,$2,now())
@@ -149,7 +173,7 @@ async def question(pool, qid, creator_id):
 
 async def save_answer(pool, qid, uid, kind, file_id, body):
     return await pool.fetchrow('''UPDATE questions SET answer_kind=$3, answer_file_id=$4, answer_body=$5,
-        answered_at=now(), answer_delivery_status='pending' WHERE id=$1 AND creator_id=$2 AND answer_kind IS NULL RETURNING *''',
+        answered_at=now(), answer_delivery_status='pending' WHERE id=$1 AND creator_id=$2 AND answer_kind IS NULL AND NOT legacy_answered AND NOT skipped RETURNING *''',
         qid, uid, kind, file_id, body)
 
 async def claim_answer(pool, qid, uid):

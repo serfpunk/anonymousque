@@ -30,6 +30,78 @@ def owner(uid, admin_ids):
 def menu():
     return kb([('📊 Общая статистика', 'adm:stats')], [('📣 Сервисное уведомление', 'adm:service')], [('💼 Рекламная рассылка', 'adm:ads')], [('📋 Последние рассылки', 'adm:jobs')])
 
+class SupportFlow(StatesGroup):
+    question = State()
+    reply = State()
+
+async def begin_support(message, state):
+    await state.clear()
+    await state.set_state(SupportFlow.question)
+    await message.answer('🆘 Напишите вопрос в поддержку одним текстовым сообщением до 2500 символов. Его получат администраторы бота вместе с вашим Telegram ID для ответа. /cancel — отмена.')
+
+@router.message(Command('support'))
+async def support_command(message: Message, state: FSMContext):
+    await begin_support(message, state)
+
+@router.callback_query(F.data == 'support')
+async def support_button(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await begin_support(callback.message, state)
+
+# Do not swallow /start and other commands while in support flow.
+def not_command(message):
+    return not (message.text or '').startswith('/')
+
+@router.message(SupportFlow.question, not_command)
+async def support_message(message: Message, state: FSMContext, bot: Bot, admin_ids):
+    text = (message.text or '').strip()
+    if not text or len(text.encode('utf-16-le')) // 2 > 2500:
+        await message.answer('Отправьте текстовое сообщение до 2500 символов. /cancel — отмена.'); return
+    if not admin_ids:
+        await message.answer('Поддержка пока не настроена. Попробуйте позже.'); return
+    delivered = 0
+    for uid in sorted(admin_ids):
+        try:
+            await bot.send_message(uid, f'🆘 Обращение в поддержку\nTelegram ID: {message.from_user.id}\n\n{text}',
+                reply_markup=kb([('✍️ Ответить пользователю',f'support:reply:{message.from_user.id}')]))
+            delivered += 1
+        except TelegramAPIError:
+            log.warning('Could not deliver a support message to an admin')
+    if delivered:
+        await state.clear()
+        await message.answer('✅ Обращение отправлено в поддержку. Ответ придёт в этот чат.')
+    else:
+        await message.answer('⚠️ Не удалось доставить обращение. Попробуйте позже. /cancel — отмена.')
+
+@router.callback_query(F.data.startswith('support:reply:'))
+async def support_reply_start(callback: CallbackQuery, state: FSMContext, admin_ids):
+    if not owner(callback.from_user.id, admin_ids):
+        await callback.answer('Нет доступа.', show_alert=True); return
+    try:
+        uid = int(callback.data.split(':')[2])
+        if uid <= 0: raise ValueError
+    except (IndexError, ValueError):
+        await callback.answer('Некорректная кнопка.', show_alert=True); return
+    await state.clear(); await state.set_state(SupportFlow.reply); await state.update_data(support_user_id=uid)
+    await callback.answer()
+    await callback.message.answer('Напишите ответ пользователю одним текстовым сообщением до 2500 символов. /cancel — отмена.')
+
+@router.message(SupportFlow.reply, not_command)
+async def support_reply(message: Message, state: FSMContext, bot: Bot, admin_ids):
+    if not owner(message.from_user.id, admin_ids): return
+    text = (message.text or '').strip()
+    if not text or len(text.encode('utf-16-le')) // 2 > 2500:
+        await message.answer('Отправьте текст до 2500 символов. /cancel — отмена.'); return
+    uid = (await state.get_data()).get('support_user_id')
+    if not uid:
+        await state.clear(); await message.answer('Действие устарело. Нажмите кнопку ответа снова.'); return
+    try:
+        await bot.send_message(uid, '🆘 Ответ поддержки\n\n' + text)
+    except TelegramAPIError:
+        await message.answer('⚠️ Не удалось доставить ответ. Пользователь мог заблокировать бота. Попробуйте ещё раз или отправьте /cancel.')
+        return
+    await state.clear(); await message.answer('✅ Ответ отправлен пользователю.')
+
 class TrackUsers(BaseMiddleware):
     async def __call__(self, handler: Callable[[Any, dict], Awaitable[Any]], event: Any, data: dict):
         user = getattr(event, 'from_user', None)
@@ -62,32 +134,41 @@ async def stats(callback: CallbackQuery, pool, admin_ids):
     if not owner(callback.from_user.id, admin_ids):
         await callback.answer('Нет доступа.', show_alert=True); return
     row = await pool.fetchrow('''SELECT COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE first_seen >= now()-interval '7 days') AS new7,
         COUNT(*) FILTER (WHERE last_seen >= now()-interval '7 days') AS active7,
         COUNT(*) FILTER (WHERE last_seen >= now()-interval '30 days') AS active30,
         COUNT(*) FILTER (WHERE NOT blocked) AS eligible,
         COUNT(*) FILTER (WHERE blocked) AS blocked FROM bot_users''')
-    creators = await pool.fetchval('SELECT COUNT(*) FROM creators')
-    questions = await pool.fetchval("SELECT COUNT(*) FROM questions WHERE delivery_status='sent'")
-    answers = await pool.fetchval("SELECT COUNT(*) FROM questions WHERE answer_delivery_status='sent'")
+    creators = await pool.fetchrow('''SELECT COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE b.last_seen >= now()-interval '7 days') AS active7
+        FROM creators c LEFT JOIN bot_users b ON b.user_id=c.user_id''')
+    q = await pool.fetchrow('''SELECT COUNT(*) FILTER (WHERE delivery_status='sent') AS total,
+        COUNT(*) FILTER (WHERE delivery_status='sent' AND created_at >= now()-interval '7 days') AS week,
+        COUNT(*) FILTER (WHERE answer_delivery_status='sent') AS answers FROM questions''')
     await callback.answer()
     await callback.message.answer(f'📊 Статистика\nВсего известных пользователей: {row["total"]}\n'
-        f'Активны за 7 / 30 дней: {row["active7"]} / {row["active30"]}\nКреаторов: {creators}\n'
-        f'Доставлено вопросов: {questions}\nДоставлено ответов: {answers}\n\n'
-        f'Потенциальные получатели рассылок: {row["eligible"]}\n'
-        f'Известно о блокировке бота: {row["blocked"]}\n\n'
-        'Активность считается с момента установки этой версии; старые пользователи включены в общее число, но дата активности может быть неизвестна.', reply_markup=menu())
+        f'Впервые замечены за 7 дней: {row["new7"]}\nАктивны за 7 / 30 дней: {row["active7"]} / {row["active30"]}\n'
+        f'Креаторов: {creators["total"]}, из них активны за 7 дней: {creators["active7"]}\n'
+        f'Доставлено вопросов: {q["total"]}, за 7 дней: {q["week"]}\nДоставлено ответов: {q["answers"]}\n\n'
+        f'Потенциальные получатели рассылок: {row["eligible"]}\nИзвестно о блокировке бота: {row["blocked"]}\n\n'
+        'Активность — действия в личном чате с ботом. Для перенесённых пользователей дата первого действия может быть неизвестна.', reply_markup=menu())
 
 @router.callback_query(F.data == 'adm:jobs')
 async def recent_jobs(callback: CallbackQuery, pool, admin_ids):
     if not owner(callback.from_user.id, admin_ids):
         await callback.answer('Нет доступа.', show_alert=True); return
-    jobs = await pool.fetch('SELECT id,category,status,created_at FROM broadcasts ORDER BY created_at DESC LIMIT 10')
+    jobs = await pool.fetch('''SELECT b.id,b.category,b.status,b.created_at,
+        COUNT(r.user_id) FILTER (WHERE r.status='sent') AS sent,
+        COUNT(r.user_id) FILTER (WHERE r.status='failed') AS failed,
+        COUNT(r.user_id) FILTER (WHERE r.status='unknown') AS unknown
+        FROM broadcasts b LEFT JOIN broadcast_recipients r ON r.broadcast_id=b.id
+        GROUP BY b.id ORDER BY b.created_at DESC LIMIT 10''')
     await callback.answer()
     if not jobs:
         await callback.message.answer('Рассылок пока нет.'); return
     for job in jobs:
         label = 'Реклама' if job['category'] == 'ads' else 'Сервисное уведомление'
-        await callback.message.answer(f'{label} · {job["created_at"].astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")} · {job["status"]}', reply_markup=job_keyboard(job['id']))
+        await callback.message.answer(f'{label} · {job["created_at"].astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")} · {job["status"]}\nОтправлено: {job["sent"]} · Ошибки: {job["failed"]} · Неизвестно: {job["unknown"]}', reply_markup=job_keyboard(job['id']))
 
 @router.callback_query(F.data.in_({'adm:service', 'adm:ads'}))
 async def compose_start(callback: CallbackQuery, state: FSMContext, admin_ids):
